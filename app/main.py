@@ -135,52 +135,62 @@ def sentence_similarity(request: SentenceSimilarityRequest):
 
 
 
-###### VAE MODEL
+###### CLASSIFIER MODEL
+# CIFAR-10 class names
+CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer', 
+                   'dog', 'frog', 'horse', 'ship', 'truck']
 
+# Global variable for classifier
+classifier = None
+classifier_device = None
 
-# Global variable for the VAE model
-vae = None
-device = None
-
-def load_vae_model():
-    """Load VAE model lazily on first request"""
-    global vae, device
-    if vae is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        vae = get_model("VAE").to(device)
+def load_classifier_model():
+    """Load classifier model lazily on first request"""
+    global classifier, classifier_device
+    if classifier is None:
+        classifier_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        classifier = get_model("Assignment2CNN").to(classifier_device)
         
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(current_dir, 'vae_model.pth')
+        model_path = os.path.join(current_dir, 'classifier_model.pth')
         
-        print(f"Loading VAE model from: {model_path}")
-        vae.load_state_dict(torch.load(model_path, map_location=device))
-        vae.eval()
-        print("VAE model loaded successfully")
+        print(f"Loading classifier model from: {model_path}")
+        classifier.load_state_dict(torch.load(model_path, map_location=classifier_device))
+        classifier.eval()
+        print("Classifier model loaded successfully")
 
-class VAEGenerateRequest(BaseModel):
-    num_samples: int = 10
+class ImageClassifyRequest(BaseModel):
+    image_base64: str
 
-@app.post("/vae/generate")
-def generate_vae_samples(request: VAEGenerateRequest):
-    """Generate samples from the trained VAE"""
-    load_vae_model()  # Load model on first request
+@app.post("/classify")
+def classify_image(request: ImageClassifyRequest):
+    """Classify a 64x64 RGB image"""
+    load_classifier_model()
     
-    vae.eval()
+    # Decode base64 image
+    img_data = base64.b64decode(request.image_base64)
+    img = Image.open(io.BytesIO(img_data)).convert('RGB')
+    img = img.resize((64, 64))
+    
+    # Convert to tensor
+    import numpy as np
+    img_array = np.array(img).transpose(2, 0, 1) / 255.0
+    img_tensor = torch.FloatTensor(img_array).unsqueeze(0).to(classifier_device)
+    
+    # Predict
+    classifier.eval()
     with torch.no_grad():
-        z = torch.randn(request.num_samples, 2).to(device)
-        samples = vae.decoder(z).cpu().numpy()
-    
-    images_base64 = []
-    for i in range(request.num_samples):
-        img_array = (samples[i].squeeze() * 255).astype('uint8')
-        img = Image.fromarray(img_array, mode='L')
-        
-        buffered = io.BytesIO()
-        img.save(buffered, format="PNG")
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-        images_base64.append(img_str)
+        outputs = classifier(img_tensor)
+        probabilities = torch.nn.functional.softmax(outputs, dim=1)
+        predicted_class = torch.argmax(probabilities, dim=1).item()
+        confidence = probabilities[0][predicted_class].item()
     
     return {
-        "num_samples": request.num_samples,
-        "images": images_base64
+        "predicted_class": CIFAR10_CLASSES[predicted_class],
+        "class_index": predicted_class,
+        "confidence": float(confidence),
+        "all_probabilities": {
+            CIFAR10_CLASSES[i]: float(probabilities[0][i]) 
+            for i in range(10)
+        }
     }

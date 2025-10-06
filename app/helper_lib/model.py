@@ -2,65 +2,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 
-# From Module_5_Practical_VAE.py
-class VariationalEncoder(nn.Module):
-    def __init__(self, latent_dim=2):
-        super(VariationalEncoder, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+# Assignment 2 - Part 1: Specific CNN Architecture
+class Assignment2CNN(nn.Module):
+    def __init__(self):
+        super(Assignment2CNN, self).__init__()
+        # Input: 64x64x3 RGB image
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)
         self.flatten = nn.Flatten()
-        self.fc_mu = nn.Linear(128 * 4 * 4, latent_dim)
-        self.fc_logvar = nn.Linear(128 * 4 * 4, latent_dim)
+        self.fc1 = nn.Linear(32 * 16 * 16, 100)  # After 2 pooling layers: 64->32->16
+        self.fc2 = nn.Linear(100, 10)
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
+        x = self.pool(x)
         x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
+        x = self.pool(x)
         x = self.flatten(x)
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x)
-        return mu, logvar
-
-class Decoder(nn.Module):
-    def __init__(self, latent_dim=2):
-        super(Decoder, self).__init__()
-        self.fc = nn.Linear(latent_dim, 128 * 4 * 4)
-        self.convtrans1 = nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1)
-        self.convtrans2 = nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1)
-        self.convtrans3 = nn.ConvTranspose2d(32, 1, kernel_size=3, stride=2, padding=1, output_padding=1)
-
-    def forward(self, x):
-        x = self.fc(x)
-        x = x.view(-1, 128, 4, 4)
-        x = F.relu(self.convtrans1(x))
-        x = F.relu(self.convtrans2(x))
-        x = torch.sigmoid(self.convtrans3(x))
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
         return x
 
-class VAE(nn.Module):
-    def __init__(self, latent_dim=2):
-        super(VAE, self).__init__()
-        self.encoder = VariationalEncoder(latent_dim)
-        self.decoder = Decoder(latent_dim)
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x):
-        mu, logvar = self.encoder(x)
-        z = self.reparameterize(mu, logvar)
-        reconstruction = self.decoder(z)
-        return reconstruction, mu, logvar
 
 def get_model(model_name, **kwargs):
     """
-    Get model by name: 'VAE'
+    Get model by name: 'FCNN', 'CNN', 'EnhancedCNN', 'Assignment2CNN'
     """
-    if model_name == 'VAE':
-        latent_dim = kwargs.get('latent_dim', 2)
-        return VAE(latent_dim=latent_dim)
+    if model_name == 'FCNN':
+        return FCNN()
+    elif model_name == 'CNN':
+        return SimpleCNN()
+    elif model_name == 'EnhancedCNN':
+        return EnhancedCNN()
+    elif model_name == 'Assignment2CNN':
+        return Assignment2CNN()
     else:
         raise ValueError(f"Unknown model: {model_name}")
