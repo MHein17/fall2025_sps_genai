@@ -6,6 +6,13 @@ import spacy
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
+from .helper_lib.model import get_model
+import torch
+import io
+import base64
+from PIL import Image
+
+import os
 app = FastAPI()
 
 # Load spaCy model for embeddings
@@ -124,4 +131,56 @@ def sentence_similarity(request: SentenceSimilarityRequest):
     return {
         "query": request.query,
         "results": results
+    }
+
+
+
+###### VAE MODEL
+
+
+# Global variable for the VAE model
+vae = None
+device = None
+
+def load_vae_model():
+    """Load VAE model lazily on first request"""
+    global vae, device
+    if vae is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        vae = get_model("VAE").to(device)
+        
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(current_dir, 'vae_model.pth')
+        
+        print(f"Loading VAE model from: {model_path}")
+        vae.load_state_dict(torch.load(model_path, map_location=device))
+        vae.eval()
+        print("VAE model loaded successfully")
+
+class VAEGenerateRequest(BaseModel):
+    num_samples: int = 10
+
+@app.post("/vae/generate")
+def generate_vae_samples(request: VAEGenerateRequest):
+    """Generate samples from the trained VAE"""
+    load_vae_model()  # Load model on first request
+    
+    vae.eval()
+    with torch.no_grad():
+        z = torch.randn(request.num_samples, 2).to(device)
+        samples = vae.decoder(z).cpu().numpy()
+    
+    images_base64 = []
+    for i in range(request.num_samples):
+        img_array = (samples[i].squeeze() * 255).astype('uint8')
+        img = Image.fromarray(img_array, mode='L')
+        
+        buffered = io.BytesIO()
+        img.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        images_base64.append(img_str)
+    
+    return {
+        "num_samples": request.num_samples,
+        "images": images_base64
     }
