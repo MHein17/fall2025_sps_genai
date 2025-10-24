@@ -194,3 +194,91 @@ def classify_image(request: ImageClassifyRequest):
             for i in range(10)
         }
     }
+
+
+
+###### GAN MODEL - MNIST DIGIT GENERATION
+from .mnist_gan import Generator
+
+# Global variable for GAN generator
+gan_generator = None
+gan_device = None
+Z_DIM = 100
+
+def load_gan_model():
+    """Load GAN generator model lazily on first request"""
+    global gan_generator, gan_device
+    if gan_generator is None:
+        gan_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        gan_generator = Generator(z_dim=Z_DIM).to(gan_device)
+        
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(current_dir, 'models', 'generator.pth')
+        
+        print(f"Loading GAN generator from: {model_path}")
+        gan_generator.load_state_dict(torch.load(model_path, map_location=gan_device))
+        gan_generator.eval()
+        print("GAN generator loaded successfully")
+
+class DigitGenerationRequest(BaseModel):
+    num_digits: int = 1
+    seed: int = None  # Optional seed for reproducibility
+
+@app.post("/generate_digit")
+def generate_mnist_digit(request: DigitGenerationRequest):
+    """
+    Generate MNIST-style handwritten digit(s) using trained GAN
+    
+    Parameters:
+    - num_digits: Number of digits to generate (default: 1, max: 16)
+    - seed: Optional random seed for reproducibility
+    
+    Returns:
+    - images: List of base64-encoded PNG images
+    - num_generated: Number of images generated
+    """
+    load_gan_model()
+    
+    # Limit number of digits
+    num_digits = min(max(1, request.num_digits), 16)
+    
+    # Set seed if provided
+    if request.seed is not None:
+        torch.manual_seed(request.seed)
+    
+    # Generate random noise
+    noise = torch.randn(num_digits, Z_DIM).to(gan_device)
+    
+    # Generate images
+    gan_generator.eval()
+    with torch.no_grad():
+        generated_images = gan_generator(noise)
+    
+    # Convert tensors to base64 images
+    images_base64 = []
+    for i in range(num_digits):
+        # Get single image tensor
+        img_tensor = generated_images[i]
+        
+        # Denormalize from [-1, 1] to [0, 1]
+        img_tensor = (img_tensor + 1) / 2.0
+        img_tensor = torch.clamp(img_tensor, 0, 1)
+        
+        # Convert to PIL Image
+        img_array = img_tensor.cpu().squeeze().numpy()
+        img_array = (img_array * 255).astype(np.uint8)
+        img_pil = Image.fromarray(img_array, mode='L')
+        
+        # Convert to base64
+        buffered = io.BytesIO()
+        img_pil.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        images_base64.append(img_base64)
+    
+    return {
+        "images": images_base64,
+        "num_generated": num_digits,
+        "image_size": "28x28",
+        "model": "MNIST GAN",
+        "seed_used": request.seed
+    }
