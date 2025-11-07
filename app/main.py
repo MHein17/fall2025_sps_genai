@@ -1,5 +1,6 @@
 from typing import Union, List
 from fastapi import FastAPI
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from .bigram_model import BigramModel
 import spacy
@@ -10,7 +11,10 @@ from .helper_lib.model import get_model
 import torch
 import io
 import base64
+import zipfile
+import time
 from PIL import Image
+from torchvision.utils import save_image
 
 import os
 app = FastAPI()
@@ -21,7 +25,7 @@ nlp = spacy.load("en_core_web_md")
 # Sample corpus for the bigram model
 corpus = [
     "The Count of Monte Cristo is a novel written by Alexandre Dumas. \
-It tells the story of Edmond Dantès, who is falsely imprisoned and later seeks revenge.",
+It tells the story of Edmond DantÃ¨s, who is falsely imprisoned and later seeks revenge.",
     "this is another example sentence",
     "we are generating text based on bigram probabilities",
     "bigram models are simple but effective"
@@ -222,7 +226,7 @@ def load_gan_model():
 
 class DigitGenerationRequest(BaseModel):
     num_digits: int = 1
-    seed: int = None  # Optional seed for reproducibility
+    seed: int = None
 
 @app.post("/generate_digit")
 def generate_mnist_digit(request: DigitGenerationRequest):
@@ -234,8 +238,8 @@ def generate_mnist_digit(request: DigitGenerationRequest):
     - seed: Optional random seed for reproducibility
     
     Returns:
-    - images: List of base64-encoded PNG images
-    - num_generated: Number of images generated
+    - Single PNG image if num_digits=1
+    - ZIP file with multiple PNGs if num_digits>1
     """
     load_gan_model()
     
@@ -245,6 +249,8 @@ def generate_mnist_digit(request: DigitGenerationRequest):
     # Set seed if provided
     if request.seed is not None:
         torch.manual_seed(request.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(request.seed)
     
     # Generate random noise
     noise = torch.randn(num_digits, Z_DIM).to(gan_device)
@@ -254,31 +260,230 @@ def generate_mnist_digit(request: DigitGenerationRequest):
     with torch.no_grad():
         generated_images = gan_generator(noise)
     
-    # Convert tensors to base64 images
-    images_base64 = []
-    for i in range(num_digits):
-        # Get single image tensor
-        img_tensor = generated_images[i]
-        
-        # Denormalize from [-1, 1] to [0, 1]
+    # Single image: return PNG directly
+    if num_digits == 1:
+        img_tensor = generated_images[0]
         img_tensor = (img_tensor + 1) / 2.0
         img_tensor = torch.clamp(img_tensor, 0, 1)
         
-        # Convert to PIL Image
-        img_array = img_tensor.cpu().squeeze().numpy()
-        img_array = (img_array * 255).astype(np.uint8)
-        img_pil = Image.fromarray(img_array, mode='L')
-        
-        # Convert to base64
-        buffered = io.BytesIO()
-        img_pil.save(buffered, format="PNG")
-        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-        images_base64.append(img_base64)
+        buffer = io.BytesIO()
+        save_image(img_tensor, buffer, format="PNG")
+        buffer.seek(0)
+        return Response(content=buffer.getvalue(), media_type="image/png")
     
-    return {
-        "images": images_base64,
-        "num_generated": num_digits,
-        "image_size": "28x28",
-        "model": "MNIST GAN",
-        "seed_used": request.seed
-    }
+    # Multiple images: return ZIP
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i in range(num_digits):
+            img_tensor = generated_images[i]
+            img_tensor = (img_tensor + 1) / 2.0
+            img_tensor = torch.clamp(img_tensor, 0, 1)
+            
+            b = io.BytesIO()
+            save_image(img_tensor, b, format="PNG")
+            b.seek(0)
+            zf.writestr(f"digit_{i:02d}.png", b.read())
+    
+    zip_buffer.seek(0)
+    filename = f"mnist_digits_{int(time.time())}.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+
+
+
+###### ENERGY-BASED MODEL - CIFAR-10 IMAGE GENERATION
+from .energy_model import EnergyModel, generate_samples as energy_generate_samples
+
+# Global variable for energy model
+energy_model = None
+energy_device = None
+
+def load_energy_model():
+    """Load Energy-Based Model lazily on first request"""
+    global energy_model, energy_device
+    if energy_model is None:
+        energy_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        energy_model = EnergyModel().to(energy_device)
+        
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(current_dir, 'models', 'energy_model.pth')
+        
+        print(f"Loading Energy-Based Model from: {model_path}")
+        energy_model.load_state_dict(torch.load(model_path, map_location=energy_device))
+        energy_model.eval()
+        print("Energy-Based Model loaded successfully")
+
+class EnergyGenerationRequest(BaseModel):
+    num_images: int = 1
+    steps: int = 256
+    step_size: float = 10.0
+    noise_std: float = 0.01
+    seed: int = None
+
+@app.post("/generate_energy")
+def generate_energy_images(request: EnergyGenerationRequest):
+    """
+    Generate CIFAR-10-style images using trained Energy-Based Model
+    
+    Parameters:
+    - num_images: Number of images to generate (default: 1, max: 16)
+    - steps: Number of Langevin dynamics steps (default: 256)
+    - step_size: Step size for gradient descent (default: 10.0)
+    - noise_std: Standard deviation of noise (default: 0.01)
+    - seed: Optional random seed for reproducibility
+    
+    Returns:
+    - Single PNG image if num_images=1
+    - ZIP file with multiple PNGs if num_images>1
+    """
+    load_energy_model()
+    
+    # Limit number of images
+    num_images = min(max(1, request.num_images), 16)
+    
+    # Set seed if provided
+    if request.seed is not None:
+        torch.manual_seed(request.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(request.seed)
+    
+    # Generate random starting images in [-1, 1]
+    x = torch.rand((num_images, 3, 32, 32), device=energy_device) * 2 - 1
+    
+    # Generate images using Langevin dynamics
+    generated_images = energy_generate_samples(
+        energy_model, x, 
+        steps=request.steps, 
+        step_size=request.step_size, 
+        noise_std=request.noise_std
+    )
+    
+    # Single image: return PNG directly
+    if num_images == 1:
+        img_tensor = generated_images[0]
+        img_tensor = (img_tensor + 1) / 2.0
+        img_tensor = torch.clamp(img_tensor, 0, 1)
+        
+        buffer = io.BytesIO()
+        save_image(img_tensor, buffer, format="PNG")
+        buffer.seek(0)
+        return Response(content=buffer.getvalue(), media_type="image/png")
+    
+    # Multiple images: return ZIP
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i in range(num_images):
+            img_tensor = generated_images[i]
+            img_tensor = (img_tensor + 1) / 2.0
+            img_tensor = torch.clamp(img_tensor, 0, 1)
+            
+            b = io.BytesIO()
+            save_image(img_tensor, b, format="PNG")
+            b.seek(0)
+            zf.writestr(f"energy_{i:02d}.png", b.read())
+    
+    zip_buffer.seek(0)
+    filename = f"energy_images_{int(time.time())}.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+
+
+
+###### DIFFUSION MODEL - CIFAR-10 IMAGE GENERATION
+from .diffusion_model import DiffusionModel, UNet, offset_cosine_diffusion_schedule
+
+# Global variable for diffusion model
+diffusion_model = None
+diffusion_device = None
+
+def load_diffusion_model():
+    """Load Diffusion Model lazily on first request"""
+    global diffusion_model, diffusion_device
+    if diffusion_model is None:
+        diffusion_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Create UNet and Diffusion Model
+        unet = UNet(image_size=32, num_channels=3, embedding_dim=32)
+        diffusion_model = DiffusionModel(unet, offset_cosine_diffusion_schedule)
+        diffusion_model.to(diffusion_device)
+        
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(current_dir, 'models', 'diffusion_model.pth')
+        
+        print(f"Loading Diffusion Model from: {model_path}")
+        checkpoint = torch.load(model_path, map_location=diffusion_device)
+        
+        # Load model state
+        diffusion_model.network.load_state_dict(checkpoint['model_state_dict'])
+        diffusion_model.ema_network.load_state_dict(checkpoint['ema_model_state_dict'])
+        # Fix: Move normalizer tensors to correct device
+        diffusion_model.normalizer_mean = checkpoint['normalizer_mean'].to(diffusion_device)
+        diffusion_model.normalizer_std = checkpoint['normalizer_std'].to(diffusion_device)
+        
+        diffusion_model.eval()
+        print("Diffusion Model loaded successfully")
+
+class DiffusionGenerationRequest(BaseModel):
+    num_images: int = 1
+    diffusion_steps: int = 50
+    seed: int = None
+
+@app.post("/generate_diffusion")
+def generate_diffusion_images(request: DiffusionGenerationRequest):
+    """
+    Generate CIFAR-10-style images using trained Diffusion Model
+    
+    Parameters:
+    - num_images: Number of images to generate (default: 1, max: 16)
+    - diffusion_steps: Number of reverse diffusion steps (default: 50)
+    - seed: Optional random seed for reproducibility
+    
+    Returns:
+    - Single PNG image if num_images=1
+    - ZIP file with multiple PNGs if num_images>1
+    """
+    load_diffusion_model()
+    
+    # Limit number of images
+    num_images = min(max(1, request.num_images), 16)
+    
+    # Set seed if provided
+    if request.seed is not None:
+        torch.manual_seed(request.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(request.seed)
+    
+    # Generate images
+    diffusion_model.eval()
+    generated_images = diffusion_model.generate(
+        num_images=num_images,
+        diffusion_steps=request.diffusion_steps,
+        image_size=32
+    )
+    
+    # Single image: return PNG directly
+    if num_images == 1:
+        img_tensor = generated_images[0]
+        img_tensor = torch.clamp(img_tensor, 0, 1)
+        
+        buffer = io.BytesIO()
+        save_image(img_tensor, buffer, format="PNG")
+        buffer.seek(0)
+        return Response(content=buffer.getvalue(), media_type="image/png")
+    
+    # Multiple images: return ZIP
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i in range(num_images):
+            img_tensor = generated_images[i]
+            img_tensor = torch.clamp(img_tensor, 0, 1)
+            
+            b = io.BytesIO()
+            save_image(img_tensor, b, format="PNG")
+            b.seek(0)
+            zf.writestr(f"diffusion_{i:02d}.png", b.read())
+    
+    zip_buffer.seek(0)
+    filename = f"diffusion_images_{int(time.time())}.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
