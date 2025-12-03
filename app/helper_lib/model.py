@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+from transformers import AutoModelForCausalLM
 
 # Assignment 2 - Part 1: Specific CNN Architecture
 class Assignment2CNN(nn.Module):
@@ -27,7 +28,7 @@ class Assignment2CNN(nn.Module):
 
 def get_model(model_name, **kwargs):
     """
-    Get model by name: 'FCNN', 'CNN', 'EnhancedCNN', 'Assignment2CNN'
+    Get model by name: 'FCNN', 'CNN', 'EnhancedCNN', 'Assignment2CNN', 'GPT2'
     """
     if model_name == 'FCNN':
         return FCNN()
@@ -37,5 +38,8 @@ def get_model(model_name, **kwargs):
         return EnhancedCNN()
     elif model_name == 'Assignment2CNN':
         return Assignment2CNN()
+    elif model_name == 'GPT2':
+        model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
+        return model
     else:
         raise ValueError(f"Unknown model: {model_name}")

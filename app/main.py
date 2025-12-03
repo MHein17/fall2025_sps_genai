@@ -15,6 +15,8 @@ import zipfile
 import time
 from PIL import Image
 from torchvision.utils import save_image
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 
 import os
 app = FastAPI()
@@ -487,3 +489,85 @@ def generate_diffusion_images(request: DiffusionGenerationRequest):
     filename = f"diffusion_images_{int(time.time())}.zip"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+
+
+###### LLM TEXT GENERATION WITH RL POST-TRAINING
+# Global variables for LLM
+llm_model = None
+llm_tokenizer = None
+llm_device = None
+
+def load_llm_model():
+    """Load RL post-trained LLM model lazily on first request"""
+    global llm_model, llm_tokenizer, llm_device
+    if llm_model is None:
+        llm_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Load tokenizer
+        llm_tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+        llm_tokenizer.pad_token = llm_tokenizer.eos_token
+        
+        # Load model
+        llm_model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
+        llm_model.to(llm_device)
+        
+        # Try to load RL-trained checkpoint
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        rl_model_path = os.path.join(current_dir, 'checkpoints', 'gpt2-rl', 'rl_model.pth')
+        
+        if os.path.exists(rl_model_path):
+            print(f"Loading RL-trained model from: {rl_model_path}")
+            checkpoint = torch.load(rl_model_path, map_location=llm_device)
+            llm_model.load_state_dict(checkpoint['model_state_dict'])
+            print("RL-trained model loaded successfully")
+        else:
+            # Try to load fine-tuned checkpoint
+            ft_model_path = os.path.join(current_dir, 'checkpoints', 'gpt2-squad', 'checkpoint_epoch_4.pth')
+            if os.path.exists(ft_model_path):
+                print(f"Loading fine-tuned model from: {ft_model_path}")
+                checkpoint = torch.load(ft_model_path, map_location=llm_device)
+                llm_model.load_state_dict(checkpoint['model_state_dict'])
+                print("Fine-tuned model loaded successfully")
+            else:
+                print("Using base GPT-2 model (no fine-tuning or RL training found)")
+        
+        llm_model.eval()
+
+@app.post("/generate_with_llm")
+def generate_with_llm(request: TextGenerationRequest):
+    """
+    Generate text using RL post-trained LLM
+    
+    Parameters:
+    - start_word: The starting prompt/question
+    - length: Maximum length of generated text (in tokens)
+    
+    Returns:
+    - generated_text: The generated response
+    """
+    load_llm_model()
+    
+    # Encode input
+    input_ids = llm_tokenizer.encode(request.start_word, return_tensors='pt').to(llm_device)
+    
+    # Generate response
+    llm_model.eval()
+    with torch.no_grad():
+        output = llm_model.generate(
+            input_ids,
+            max_length=min(request.length, 200),  # Cap at 200 tokens
+            num_return_sequences=1,
+            temperature=0.8,
+            do_sample=True,
+            top_p=0.9,
+            pad_token_id=llm_tokenizer.eos_token_id,
+            eos_token_id=llm_tokenizer.eos_token_id
+        )
+    
+    generated_text = llm_tokenizer.decode(output[0], skip_special_tokens=True)
+    
+    return {
+        "generated_text": generated_text,
+        "model_type": "RL post-trained GPT-2",
+        "prompt": request.start_word
+    }
